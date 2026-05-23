@@ -61,3 +61,14 @@ model Reservation {
   @@index([status, expiresAt])
   @@index([productId, warehouseId])
 }
+
+model IdempotencyKey {
+  id         String   @id @default(cuid())
+  key        String   @unique
+  endpoint   String
+  response   Json
+  statusCode Int
+  createdAt  DateTime @default(now())
+
+  @@index([key])
+}

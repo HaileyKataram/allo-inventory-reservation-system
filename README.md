@@ -1,53 +1,107 @@
 # Allo Inventory Reservations
 
-A production-style ecommerce reservation system built with Next.js App Router, TypeScript, Prisma, PostgreSQL, TailwindCSS, shadcn-style UI primitives, and Zod.
+Race-condition-safe ecommerce inventory reservations built with Next.js App Router, TypeScript, Prisma, PostgreSQL, TailwindCSS, shadcn-style primitives, and Zod.
 
-The main goal is concurrency correctness: when two shoppers try to reserve the final unit at the same time, exactly one request succeeds and the other receives HTTP 409.
+The core invariant: if two shoppers reserve the last unit at the same time, exactly one succeeds and the other receives HTTP 409.
 
 ## Architecture
 
-- `app/api/products` and `app/api/warehouses` expose read endpoints for the frontend.
-- `app/api/reservations` creates checkout holds.
-- `app/api/reservations/[id]/confirm` converts a pending reservation into a sale.
-- `app/api/reservations/[id]/release` cancels a pending hold.
-- `lib/reservation-service.ts` owns transaction-safe reservation, confirmation, and release logic.
-- `lib/inventory-service.ts` owns inventory read models.
-- `lib/cleanup-service.ts` owns lazy and cron-compatible expiry.
-- `prisma/schema.prisma` defines the product, warehouse, inventory, and reservation model.
+- `app/api/*`: thin HTTP routes, validation, response shaping.
+- `lib/reservation-service.ts`: transactional reservation, confirmation, and release logic.
+- `lib/inventory-service.ts`: inventory read models and availability shaping.
+- `lib/cleanup-service.ts`: lazy and cron-compatible expiry cleanup.
+- `lib/idempotency.ts`: Stripe-style response replay for safe retries.
+- `prisma/schema.prisma`: products, warehouses, inventory, reservations, idempotency keys.
+- `components/*`: product list, checkout hold, countdown, status badges, toast UI.
 
-Business rules live in service modules rather than route handlers so the API layer stays thin and the transaction boundaries are easy to audit.
+## Architecture Diagram
+
+```text
+Browser UI
+  -> App Router API route
+    -> Zod validation
+      -> Idempotency wrapper when header is present
+        -> Prisma interactive transaction
+          -> PostgreSQL row/advisory locks
+            -> Inventory + Reservation tables
+```
+
+Availability is stored as `totalUnits - reservedUnits`. `reservedUnits` is denormalized intentionally so product listing reads stay simple; every state transition updates it transactionally.
 
 ## Concurrency Strategy
 
-The reservation flow uses a Prisma interactive transaction plus PostgreSQL row-level locking:
+Reservation creation uses PostgreSQL row-level locking inside a Prisma transaction:
 
-1. `SELECT ... FROM "Inventory" ... FOR UPDATE`
-2. Compute `available = totalUnits - reservedUnits`
-3. Return HTTP 409 if the requested quantity is not available
-4. Create a `PENDING` reservation
-5. Increment `Inventory.reservedUnits`
-6. Commit
+1. Lock the target inventory row with `SELECT ... FOR UPDATE`.
+2. Compute available stock from the locked row.
+3. Return HTTP 409 when available stock is insufficient.
+4. Create the pending reservation.
+5. Increment `reservedUnits`.
+6. Commit.
 
-The lock is held until commit, so concurrent attempts for the same product and warehouse serialize on the inventory row. There is no naive read-then-update window where two requests can both observe the same final unit.
+The lock is scoped to one `(productId, warehouseId)` inventory row. Concurrent reservations for different inventory rows do not block each other.
+
+## Concurrency Validation
+
+The integration-style test in `tests/reservation-concurrency.test.ts` creates one inventory unit and runs two simultaneous `createReservation` calls against the real service logic. It asserts:
+
+- exactly one request succeeds
+- exactly one request fails
+- the failure status is HTTP 409
+- inventory ends with `reservedUnits = 1`
+
+The test is skipped unless `TEST_DATABASE_URL` or `DATABASE_URL` points at a real migrated PostgreSQL database.
+
+## Idempotency
+
+Reservation creation and confirmation support the `Idempotency-Key` header. This protects checkout flows where clients retry after a timeout, network loss, browser refresh, or payment handoff.
+
+When a key is present:
+
+1. The API opens a transaction.
+2. PostgreSQL takes an advisory transaction lock for the key.
+3. Existing keys replay the original JSON response and status code.
+4. New keys execute the business operation and store the exact response before commit.
+
+Duplicate create requests do not reserve stock twice. Duplicate confirm requests do not decrement inventory twice. Keys are globally unique, so clients should generate a fresh key per operation.
+
+`deleteIdempotencyKeysOlderThan` exists for future TTL cleanup once retention policy is defined.
 
 ## Reservation Lifecycle
 
-- `PENDING`: stock is held temporarily and included in `reservedUnits`.
-- `CONFIRMED`: stock becomes sold; confirmation decrements both `totalUnits` and `reservedUnits`.
+- `PENDING`: stock is held and counted in `reservedUnits`.
+- `CONFIRMED`: stock is sold; confirmation decrements both `totalUnits` and `reservedUnits`.
 - `RELEASED`: shopper cancels; release decrements `reservedUnits`.
 - `EXPIRED`: hold times out; cleanup decrements `reservedUnits`.
 
-Confirm also locks the reservation row and inventory row. If the reservation has expired, it is marked `EXPIRED`, reserved stock is released, and the endpoint returns HTTP 410.
+Confirmation locks the reservation row and inventory row. If the hold has expired, it is marked `EXPIRED`, stock is released, and the endpoint returns HTTP 410.
 
-## Expiry Mechanism
+## Expiry
 
-The app uses a hybrid expiry strategy:
+The system uses a hybrid strategy:
 
-- Lazy cleanup runs before product availability reads, keeping shopper-facing stock fresh.
-- `POST /api/cron/expire-reservations` is suitable for a scheduled Vercel Cron job.
-- `npm run cleanup:expired` runs the same cleanup utility from the command line.
+- Lazy cleanup runs before product availability reads.
+- `POST /api/cron/expire-reservations` can be called by Vercel Cron.
+- `npm run cleanup:expired` runs the same cleanup from the command line.
 
-Cleanup uses `FOR UPDATE SKIP LOCKED`, which lets multiple cleanup workers safely process expired reservations without fighting over the same rows.
+Cleanup uses `FOR UPDATE SKIP LOCKED` so multiple workers can safely process expired holds without double-releasing inventory.
+
+## Reliability Guarantees
+
+- No overselling for concurrent reservations against the same inventory row.
+- Reservation retries with the same idempotency key replay the original response.
+- Confirmation retries with the same idempotency key do not double-decrement stock.
+- Expired holds release reserved stock exactly once.
+- Route handlers remain thin; transaction logic stays in service modules.
+
+## Failure Scenarios Handled
+
+- Insufficient stock returns HTTP 409.
+- Expired confirmation returns HTTP 410.
+- Duplicate idempotent requests replay the stored response.
+- Concurrent expiry workers skip locked rows.
+- Missing product/warehouse inventory returns HTTP 404.
+- Unexpected API failures surface as user-facing error states and toasts.
 
 ## Setup
 
@@ -56,8 +110,6 @@ Create `.env`:
 ```bash
 DATABASE_URL="postgresql://USER:PASSWORD@HOST:5432/DATABASE?sslmode=require"
 ```
-
-For local Postgres, omit `sslmode=require` if your database does not use TLS.
 
 Install dependencies:
 
@@ -80,37 +132,35 @@ npm run dev
 
 Open `http://localhost:3000/products`.
 
-## Testing the Race Condition
+## Testing Strategy
 
-Seed data includes one product with a single unit in the East warehouse. Send two concurrent requests for that same product and warehouse:
+- `npm run lint`: static lint checks.
+- `npm exec tsc -- --noEmit`: TypeScript verification.
+- `npm run build`: production Next.js build and Prisma generation.
+- `npm run test`: Vitest suite; database-backed tests run when `TEST_DATABASE_URL` or `DATABASE_URL` is set.
 
-```bash
-curl -X POST http://localhost:3000/api/reservations \
-  -H "Content-Type: application/json" \
-  -d '{"productId":"PRODUCT_ID","warehouseId":"WAREHOUSE_ID","quantity":1}'
-```
+For manual race validation, send two parallel `POST /api/reservations` requests for the seeded single-unit product/warehouse. One should return `201`; one should return `409`.
 
-Run the command twice in parallel. One request should return `201`, and the other should return `409`.
+## Production Deployment Notes
 
-## Deployment
-
-This project is compatible with Supabase Postgres and Vercel:
-
+- Use Supabase or another managed PostgreSQL instance.
+- Run `prisma migrate deploy` from CI/CD before serving traffic.
 - Set `DATABASE_URL` in Vercel project settings.
-- Run migrations during deployment or from CI with `prisma migrate deploy`.
 - Configure Vercel Cron to call `POST /api/cron/expire-reservations`.
-- Keep Prisma Client generation in the build script.
+- Keep Prisma Client generation in the build step.
+- Use short retention for idempotency keys once operational retry windows are known.
+- Add request fingerprinting before accepting untrusted idempotency reuse across payloads.
 
 ## Tradeoffs
 
-- The inventory model stores `reservedUnits` for fast reads and simple availability checks. This is denormalized, so all reservation state transitions must update it transactionally.
-- Row-level locks are intentionally scoped to one inventory row. That keeps contention localized to a product and warehouse pair.
-- The demo does not include user accounts or payment capture, but the reservation lifecycle is designed to sit before payment authorization.
+- `reservedUnits` is denormalized for fast availability reads; correctness depends on transactional updates.
+- Row locks serialize hot inventory rows, which is expected for scarce stock.
+- Advisory locks are used only for idempotency replay and do not replace inventory row locks.
+- Authentication, payment capture, and order records are outside this take-home scope.
 
 ## Future Improvements
 
-- Add automated concurrency tests with a real Postgres test container.
-- Add idempotency keys for reservation creation and confirmation.
-- Add payment intent integration and order records.
+- Add request fingerprints to reject accidental key reuse with a different payload.
+- Add payment intent and order tables.
 - Add admin inventory adjustment workflows.
-- Emit domain events for analytics and warehouse operations.
+- Add metrics for conflict rate, expiry volume, and lock wait time.

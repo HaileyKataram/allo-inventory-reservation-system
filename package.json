@@ -7,6 +7,7 @@
     "build": "prisma generate && next build",
     "start": "next start",
     "lint": "eslint .",
+    "test": "vitest run",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:seed": "tsx prisma/seed.ts",
@@ -18,7 +19,6 @@
     "@radix-ui/react-slot": "latest",
     "class-variance-authority": "latest",
     "clsx": "latest",
-    "dotenv": "^17.4.2",
     "lucide-react": "latest",
     "next": "latest",
     "pg": "^8.21.0",
@@ -38,7 +38,8 @@
     "prisma": "latest",
     "tailwindcss": "latest",
     "tsx": "latest",
-    "typescript": "latest"
+    "typescript": "latest",
+    "vitest": "^4.1.7"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"

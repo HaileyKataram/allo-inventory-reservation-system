@@ -54,111 +54,70 @@ export function toReservationDto(reservation: {
   };
 }
 
+export type ReservationTransaction = Prisma.TransactionClient;
+
 export async function createReservation(input: {
   productId: string;
   warehouseId: string;
   quantity: number;
   ttlMs?: number;
 }) {
-  const ttlMs = input.ttlMs ?? DEFAULT_RESERVATION_TTL_MS;
-
   return prisma.$transaction(
-    async (tx) => {
-      const [inventory] = await tx.$queryRaw<InventoryLockRow[]>`
-        SELECT id, "productId", "warehouseId", "totalUnits", "reservedUnits"
-        FROM "Inventory"
-        WHERE "productId" = ${input.productId} AND "warehouseId" = ${input.warehouseId}
-        FOR UPDATE
-      `;
-
-      if (!inventory) {
-        throw new HttpError(404, "Inventory was not found for this product and warehouse.");
-      }
-
-      const availableUnits = inventory.totalUnits - inventory.reservedUnits;
-
-      if (availableUnits < input.quantity) {
-        throw new HttpError(409, "Insufficient stock for this reservation.");
-      }
-
-      const reservation = await tx.reservation.create({
-        data: {
-          productId: input.productId,
-          warehouseId: input.warehouseId,
-          quantity: input.quantity,
-          expiresAt: new Date(Date.now() + ttlMs)
-        }
-      });
-
-      await tx.inventory.update({
-        where: { id: inventory.id },
-        data: {
-          reservedUnits: { increment: input.quantity }
-        }
-      });
-
-      return toReservationDto(reservation);
-    },
+    async (tx) => createReservationInTransaction(tx, input),
     { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted }
   );
 }
 
+export async function createReservationInTransaction(
+  tx: ReservationTransaction,
+  input: {
+    productId: string;
+    warehouseId: string;
+    quantity: number;
+    ttlMs?: number;
+  }
+) {
+  const ttlMs = input.ttlMs ?? DEFAULT_RESERVATION_TTL_MS;
+
+  const [inventory] = await tx.$queryRaw<InventoryLockRow[]>`
+    SELECT id, "productId", "warehouseId", "totalUnits", "reservedUnits"
+    FROM "Inventory"
+    WHERE "productId" = ${input.productId} AND "warehouseId" = ${input.warehouseId}
+    FOR UPDATE
+  `;
+
+  if (!inventory) {
+    throw new HttpError(404, "Inventory was not found for this product and warehouse.");
+  }
+
+  const availableUnits = inventory.totalUnits - inventory.reservedUnits;
+
+  if (availableUnits < input.quantity) {
+    throw new HttpError(409, "Insufficient stock for this reservation.");
+  }
+
+  const reservation = await tx.reservation.create({
+    data: {
+      productId: input.productId,
+      warehouseId: input.warehouseId,
+      quantity: input.quantity,
+      expiresAt: new Date(Date.now() + ttlMs)
+    }
+  });
+
+  await tx.inventory.update({
+    where: { id: inventory.id },
+    data: {
+      reservedUnits: { increment: input.quantity }
+    }
+  });
+
+  return toReservationDto(reservation);
+}
+
 export async function confirmReservation(id: string) {
   const result = await prisma.$transaction(
-    async (tx) => {
-      const [reservation] = await tx.$queryRaw<ReservationLockRow[]>`
-        SELECT id, "productId", "warehouseId", quantity, status, "expiresAt"
-        FROM "Reservation"
-        WHERE id = ${id}
-        FOR UPDATE
-      `;
-
-      if (!reservation) {
-        throw new HttpError(404, "Reservation was not found.");
-      }
-
-      if (reservation.status !== ReservationStatus.PENDING) {
-        throw new HttpError(409, `Reservation is already ${reservation.status.toLowerCase()}.`);
-      }
-
-      if (reservation.expiresAt <= new Date()) {
-        const expired = await expireLockedReservation(tx, reservation);
-        return { reservation: toReservationDto(expired), expired: true };
-      }
-
-      const [inventory] = await tx.$queryRaw<InventoryLockRow[]>`
-        SELECT id, "productId", "warehouseId", "totalUnits", "reservedUnits"
-        FROM "Inventory"
-        WHERE "productId" = ${reservation.productId} AND "warehouseId" = ${reservation.warehouseId}
-        FOR UPDATE
-      `;
-
-      if (!inventory) {
-        throw new HttpError(404, "Inventory was not found for this reservation.");
-      }
-
-      if (inventory.reservedUnits < reservation.quantity || inventory.totalUnits < reservation.quantity) {
-        throw new HttpError(409, "Inventory is inconsistent for this reservation.");
-      }
-
-      const confirmed = await tx.reservation.update({
-        where: { id },
-        data: {
-          status: ReservationStatus.CONFIRMED,
-          confirmedAt: new Date()
-        }
-      });
-
-      await tx.inventory.update({
-        where: { id: inventory.id },
-        data: {
-          totalUnits: { decrement: reservation.quantity },
-          reservedUnits: { decrement: reservation.quantity }
-        }
-      });
-
-      return { reservation: toReservationDto(confirmed), expired: false };
-    },
+    async (tx) => confirmReservationInTransaction(tx, id),
     { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted }
   );
 
@@ -167,6 +126,61 @@ export async function confirmReservation(id: string) {
   }
 
   return result.reservation;
+}
+
+export async function confirmReservationInTransaction(tx: ReservationTransaction, id: string) {
+  const [reservation] = await tx.$queryRaw<ReservationLockRow[]>`
+    SELECT id, "productId", "warehouseId", quantity, status, "expiresAt"
+    FROM "Reservation"
+    WHERE id = ${id}
+    FOR UPDATE
+  `;
+
+  if (!reservation) {
+    throw new HttpError(404, "Reservation was not found.");
+  }
+
+  if (reservation.status !== ReservationStatus.PENDING) {
+    throw new HttpError(409, `Reservation is already ${reservation.status.toLowerCase()}.`);
+  }
+
+  if (reservation.expiresAt <= new Date()) {
+    const expired = await expireLockedReservation(tx, reservation);
+    return { reservation: toReservationDto(expired), expired: true };
+  }
+
+  const [inventory] = await tx.$queryRaw<InventoryLockRow[]>`
+    SELECT id, "productId", "warehouseId", "totalUnits", "reservedUnits"
+    FROM "Inventory"
+    WHERE "productId" = ${reservation.productId} AND "warehouseId" = ${reservation.warehouseId}
+    FOR UPDATE
+  `;
+
+  if (!inventory) {
+    throw new HttpError(404, "Inventory was not found for this reservation.");
+  }
+
+  if (inventory.reservedUnits < reservation.quantity || inventory.totalUnits < reservation.quantity) {
+    throw new HttpError(409, "Inventory is inconsistent for this reservation.");
+  }
+
+  const confirmed = await tx.reservation.update({
+    where: { id },
+    data: {
+      status: ReservationStatus.CONFIRMED,
+      confirmedAt: new Date()
+    }
+  });
+
+  await tx.inventory.update({
+    where: { id: inventory.id },
+    data: {
+      totalUnits: { decrement: reservation.quantity },
+      reservedUnits: { decrement: reservation.quantity }
+    }
+  });
+
+  return { reservation: toReservationDto(confirmed), expired: false };
 }
 
 export async function releaseReservation(id: string) {
